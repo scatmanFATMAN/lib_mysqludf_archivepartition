@@ -8,12 +8,18 @@
 #include <mysql.h>
 
 /**
- * I have not been able to find any documentation on it but apparently you CANNOT call mysql_init() in the
- * _init() functions. Anytime I tried to, it'd overwrite 2 pointer sizes after the MYSQL structure and things
- * would crash. Moving it out of the _init() function works just fine.
+ * I have not been able to find any documentation on it but whenever I try to allocate the MYSQL object
+ * on the stack and use mysql_init(&mysql), other data on the stack gets corrupted. Switching the MYSQL object to
+ * a pointer and using mysql = mysql_init(NULL) works fine. I'm not sure what the issue is with allocating the
+ * MySQL object on the stack inside a UDF.
  */
 
-#define RESULT_MAX_LEN 255
+#define RESULT_MAX_LEN (255 - 1)
+
+typedef struct {
+    unsigned int port;
+    const char *socket;
+} config_t;
 
 typedef struct {
     const char *user;
@@ -22,7 +28,6 @@ typedef struct {
     const char *table;
     const char *partition;
     const char *data_directory;
-    char file_from[2048 + 256];
 } params_t;
 
 static void
@@ -35,8 +40,84 @@ args_to_params(UDF_ARGS *args, params_t *params) {
     params->data_directory = args->args[5];
 }
 
+static config_t config = {
+    .port = 3306,
+    .socket = "/var/run/mysqld/mysqld.sock"
+};
+
+static size_t
+strlcpy(char *dst, const char *src, size_t size) {
+    const char *orig;
+    size_t left;
+
+    orig = src;
+    left = size;
+
+    if (left != 0) {
+        while (--left != 0) {
+            if ((*dst++ = *src++) == '\0') {
+                break;
+            }
+        }
+    }
+
+    if (left == 0) {
+        if (size != 0) {
+            *dst = '\0';
+        }
+        while (*src++);
+    }
+
+    return src - orig - 1;
+}
+
+/**
+ * Get a MySQL variable.
+ *
+ * @param[in] mysql The MySQL context. 
+ * @param[in] name The name of the variable.
+ * @param[out] value The value of the variable 'name'.
+ * @param[in] value_size The size of the array 'value'.
+ * @param[out] value_len The string length of the array 'value'.
+ * @param[out] error MySQL's UDF error array to store an error message in, if one occurs.
+ * @return true on success, otherwise false.
+ */
 static bool
-validate_partition(MYSQL *mysql, params_t *params, char *message) {
+get_variable(MYSQL *mysql, const char *name, char *value, size_t value_size, size_t *value_len, char *error, unsigned long *error_len) {
+    MYSQL_RES *res;
+    MYSQL_ROW row;
+    bool success = false;
+    char query[256];
+    int len;
+
+    len = snprintf(query, sizeof(query), "SHOW VARIABLES WHERE `Variable_name`='%s'", name);
+
+    if (mysql_real_query(mysql, query, len) != 0) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error getting variable '%s': %s", name, mysql_error(mysql));
+        return false;
+    }
+
+    res = mysql_store_result(mysql);
+    if (res == NULL) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error getting variable '%s': %s", name, mysql_error(mysql));
+        return false;
+    }
+
+    row = mysql_fetch_row(res);
+    if (row == NULL) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Variable '%s' not found", name);
+    }
+    else {
+        *value_len = strlcpy(value, row[1], value_size);
+        success = true;
+    }
+
+    mysql_free_result(res);
+    return success;
+}
+
+static bool
+validate_partition(MYSQL *mysql, params_t *params, char *error, unsigned long *error_len) {
     MYSQL_RES *res;
     MYSQL_ROW row;
     char query[128];
@@ -49,17 +130,22 @@ validate_partition(MYSQL *mysql, params_t *params, char *message) {
                                          params->table, params->partition);
 
     if (mysql_real_query(mysql, query, len) != 0) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Error validating partition: %s", mysql_error(mysql));
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error validating partition: %s", mysql_error(mysql));
         return false;
     }
 
     res = mysql_store_result(mysql);
+    if (res == NULL) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error validating partition: %s", mysql_error(mysql));
+        return false;
+    }
+
     row = mysql_fetch_row(res);
     count = atoi(row[0]);
     mysql_free_result(res);
 
     if (count == 0) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Error validating partition: Partition not found");
+        *error_len = strlcpy(error, "Partition not found", RESULT_MAX_LEN);
         return false;
     }
 
@@ -67,41 +153,28 @@ validate_partition(MYSQL *mysql, params_t *params, char *message) {
 }
 
 static bool
-get_from_partition_path(MYSQL *mysql, params_t *params, char *message) {
-    MYSQL_RES *res;
-    MYSQL_ROW row;
-    bool success = false;
-    char query[128], dir[2048];
-    int len;
+get_file_from(MYSQL *mysql, params_t *params, char *file_from, size_t file_from_size, char *error, unsigned long *error_len) {
+    bool success;
+    char dir[2048];
+    size_t dir_len;
 
-    len = snprintf(query, sizeof(query), "SHOW VARIABLES WHERE Variable_name='datadir'");
-
-    if (mysql_real_query(mysql, query, len) != 0) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Error getting data directory: %s", mysql_error(mysql));
+    success = get_variable(mysql, "datadir", dir, sizeof(dir), &dir_len, error, error_len);
+    if (!success) {
         return false;
     }
 
-    res = mysql_store_result(mysql);
-    row = mysql_fetch_row(res);
-    if (row == NULL) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Error getting data directory: Variable 'datadir' not found");
-    }
-    else {
-        strcpy(dir, row[1]);
-        len = strlen(dir);;
-        if (dir[len - 1] == '/') {
-            dir[len - 1] = '\0';
-        }
-        snprintf(params->file_from, sizeof(params->file_from), "%s/%s/%s#P#%s.ibd", dir, params->database, params->table, params->partition);
-        success = true;
+    //remove a trailing slash if it has one
+    if (dir[dir_len - 1] == '/') {
+        dir[dir_len - 1] = '\0';
     }
 
-    mysql_free_result(res);
-    return success;
+    snprintf(file_from, file_from_size, "%s/%s/%s#P#%s.ibd", dir, params->database, params->table, params->partition);
+
+    return true;
 }
 
 /**
- * Calling convention is MOVE_PARTITION('user', 'password', 'database', 'table', 'partition', 'data directory')
+ * Calling convention is MOVE_PARTITION('user', 'password', 'database', 'table', 'partition', 'new data directory')
  */
 
 my_bool
@@ -111,13 +184,13 @@ move_partition_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
     int i;
 
     if (args->arg_count != 6) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Incorrect parameter count; Expected 6");
+        strlcpy(message, "Expected 6 parameters", MYSQL_ERRMSG_SIZE);
         return 1;
     }
 
-    for (i = 0; i < 5; i++) {
-        if (args->arg_type[0] != STRING_RESULT) {
-            snprintf(message, MYSQL_ERRMSG_SIZE, "Parameter %d must be a string", i);
+    for (i = 0; i < 6; i++) {
+        if (args->arg_type[i] != STRING_RESULT) {
+            snprintf(message, MYSQL_ERRMSG_SIZE, "Parameter %d must be a string", i + 1);
             return 1;
         }
     }
@@ -125,17 +198,17 @@ move_partition_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
     args_to_params(args, &params);
 
     if (stat(params.data_directory, &st) != 0) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Failed to check data directory '%s': %s", params.data_directory, strerror(errno));
+        snprintf(message, MYSQL_ERRMSG_SIZE, "'%s': %s", params.data_directory, strerror(errno));
         return 1;
     }
 
     if (!S_ISDIR(st.st_mode)) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Failed to check data directory '%s': Not a directory", params.data_directory);
+        snprintf(message, MYSQL_ERRMSG_SIZE, "'%s' is not a directory", params.data_directory);
         return 1;
     }
 
     if (access(params.data_directory, W_OK) != 0) {
-        snprintf(message, MYSQL_ERRMSG_SIZE, "Failed to check data directory '%s': Not writable", params.data_directory);
+        snprintf(message, MYSQL_ERRMSG_SIZE, "'%s' is not not writable", params.data_directory);
         return 1;
     }
 
@@ -156,15 +229,13 @@ move_partition_deinit(UDF_INIT *initid) {
 
     if (initid->ptr != NULL) {
         params = (params_t *)initid->ptr;
-
-    //    mysql_close(&params->mysql);
         free(params);
     }
 }
 
 char *
 move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *length, char *is_null, char *error) {
-    char query[256], dir_to[2048], file_to[2048 + 256];
+    char query[256], file_from[2048 + 256], dir_to[2048], file_to[2048 + 256];
     MYSQL* mysql;
     params_t params;
     int len;
@@ -173,18 +244,23 @@ move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *le
     *error = 0;
 
     args_to_params(args, &params);
-    mysql = mysql_init(NULL);
 
-    if (mysql_real_connect(mysql, NULL, params.user, params.password, params.database, 3306, "/var/run/mysqld/mysqld.sock", 0) == NULL) {
+    mysql = mysql_init(NULL);
+    if (mysql == NULL) {
+        *length = strlcpy(result, "Out of memory", RESULT_MAX_LEN);
+        goto done;
+    }
+
+    if (mysql_real_connect(mysql, NULL, params.user, params.password, params.database, config.port, config.socket, 0) == NULL) {
         *length = snprintf(result, RESULT_MAX_LEN, "Error connecting to MySQL: %s", mysql_error(mysql));
         goto done;
     }
 
-    if (!validate_partition(mysql, &params, result)) {
+    if (!validate_partition(mysql, &params, result, length)) {
         goto done;
     }
 
-    if (!get_from_partition_path(mysql, &params, result)) {
+    if (!get_file_from(mysql, &params, file_from, sizeof(file_from), result, length)) {
         goto done;
     }
 
@@ -205,24 +281,26 @@ move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *le
         goto done;
     }
 
-    if (rename(params.file_from, file_to) != 0) {
+    if (rename(file_from, file_to) != 0) {
         *length = snprintf(result, RESULT_MAX_LEN, "Error moving partition: %s", strerror(errno));
         goto unlock;
     }
 
-    if (symlink(file_to, params.file_from) != 0) {
+    if (symlink(file_to, file_from) != 0) {
         *length = snprintf(result, RESULT_MAX_LEN, "Error creating symbolic link: %s", strerror(errno));
         goto unlock;
     }
 
-    *length = snprintf(result, RESULT_MAX_LEN, "OK");
+    *length = strlcpy(result, "OK", RESULT_MAX_LEN);
 
 unlock:
     len = snprintf(query, sizeof(query), "UNLOCK TABLES");
     mysql_real_query(mysql, query, len);
 
 done:
-    mysql_close(mysql);
+    if (mysql != NULL) {
+        mysql_close(mysql);
+    }
 
     return result;
 }
