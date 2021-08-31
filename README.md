@@ -9,7 +9,7 @@
   </tr>
   <tr>
     <td>MOVE_PARTITION(user, password, database, table, partition, data_directory)</td>
-    <td>Moves the partition to the data_directory specified as the last parameter. This function works by moving the partition to the new data directory and creating a soft link in place of the original partition file. While the partition is moving moved, a lock write will be acquired on the table. The return value be will <code>OK</code> on success, otherwise an error message is returned.<br /><br />Returns "OK" on success, otherwise it returns an error message.<br /><br />Note: The password is in clear text and may be written to logs. I haven't figured out a better way to do this yet.</td>
+    <td>Moves the partition to the data_directory specified as the last parameter. This function works by moving the partition to the new data directory and creating a soft link in place of the original partition file. While the partition is moving moved, a lock write will be acquired on the table. The return value be will <code>OK</code> on success, otherwise an error message is returned.<br /><br />Note: The password is in clear text and may be written to logs. I haven't figured out a better way to do this yet.</td>
   </tr>
 </table>
 
