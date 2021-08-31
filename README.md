@@ -1,6 +1,6 @@
 <h1>lib_mysqludf_archivepartition</h1>
 <p>MySQL User Defined Function for moving and managing partitions on disk.</p>
-<p>MySQL doesn't offer a way to to change the data directory of a partition once the partition is already created. I had a need to keep many partitions, but older partitions moved off the SSDs and onto the slower HDDs.</p>
+<p>MySQL doesn't offer a way to to change the data directory of a partition once the partition is already created. I had a need to keep many partitions, but older partitions moved off the SSDs and onto the slower HDDs. This library uses the same technique that MySQL uses when you specify a different data directory when creating a partition.</p>
 
 <table>
   <tr>
