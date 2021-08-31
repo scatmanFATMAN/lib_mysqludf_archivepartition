@@ -18,7 +18,7 @@ install: $(lib)
 	@mv $(lib) `mysql_config --plugindir`
 	@echo "Installing function in MySQL"
 	@echo -n "Enter User: "; read USER; 
-	@mysql -u $(USER) -p -e "CREATE OR REPLACE FUNCTION move_partition RETURNS string SONAME '$(lib)'"
+	@mysql -u $(USER) -p -e "CREATE OR REPLACE FUNCTION move_partition RETURNS string SONAME '$(lib)';"
 
 clean:
 	rm -f $(obj) $(lib)

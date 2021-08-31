@@ -1,0 +1,26 @@
+== Create a database
+CREATE DATABASE `test`;
+
+== Create a table with partitions
+CREATE TABLE `people` (
+	`birth_date` DATE NOT NULL,
+	`name` VARCHAR(50) NOT NULL COLLATE 'utf8_general_ci'
+)
+COLLATE='utf8_general_ci'
+ENGINE=InnoDB
+PARTITION BY RANGE(YEAR(`birth_date`)) (
+    PARTITION p1910 VALUES LESS THAN (1910),
+    PARTITION p1930 VALUES LESS THAN (1930),
+    PARTITION p1950 VALUES LESS THAN (1950),
+    PARTITION p1970 VALUES LESS THAN (1970),
+    PARTITION p1990 VALUES LESS THAN (1990),
+    PARTITION p2010 VALUES LESS THAN (2010),
+    PARTITION p2030 VALUES LESS THAN (2030),
+    PARTITION p2050 VALUES LESS THAN (2055)
+);
+
+== Move the 1910 partition to the /tmp directory
+SELECT MOVE_PARTITION('<user>', '<password>', 'test', 'people', 'p1910', '/tmp');
+
+== Test an insert into that partition
+INSERT INTO `people` (`birth_date`,`name`) VALUES ('1800-01-01', 'Scott');

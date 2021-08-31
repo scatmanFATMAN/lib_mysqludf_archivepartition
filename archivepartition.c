@@ -252,6 +252,7 @@ move_partition_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
 
     args_to_params(args, &params);
 
+    //validate the new data directory
     if (stat(params.data_directory, &st) != 0) {
         snprintf(message, MYSQL_ERRMSG_SIZE, "'%s': %s", params.data_directory, strerror(errno));
         return 1;
@@ -280,12 +281,6 @@ move_partition_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
 
 void
 move_partition_deinit(UDF_INIT *initid) {
-    params_t *params;
-
-    if (initid->ptr != NULL) {
-        params = (params_t *)initid->ptr;
-        free(params);
-    }
 }
 
 char *
@@ -311,10 +306,12 @@ move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *le
         goto done;
     }
 
+    //make sure the partition exists
     if (!validate_partition(mysql, &params, result, length)) {
         goto done;
     }
 
+    //get partition's new file name
     if (!get_file_from(mysql, &params, file_from, sizeof(file_from), result, length)) {
         goto done;
     }
