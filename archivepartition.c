@@ -4,7 +4,9 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <mysql.h>
 
 /**
@@ -173,6 +175,59 @@ get_file_from(MYSQL *mysql, params_t *params, char *file_from, size_t file_from_
     return true;
 }
 
+static bool
+copy_partition(const char *file_from, const char *file_to, char *error, unsigned long *error_len) {
+    int fd_from = -1, fd_to = -1;
+    bool success = false;
+    struct stat st;
+    off_t left;
+    ssize_t n;
+
+    fd_from = open(file_from, O_RDONLY);
+    if (fd_from == -1) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error copying partition: Opening source: %s", strerror(errno));
+        return false;
+    }
+
+    if (fstat(fd_from, &st) == -1) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error copying partition: Stat source: %s", strerror(errno));
+        goto done;
+    }
+
+    fd_to = open(file_to, O_WRONLY | O_CREAT, st.st_mode);
+    if (fd_to == -1) {
+        *error_len = snprintf(error, RESULT_MAX_LEN, "Error copying partition: Opening destination: %s", strerror(errno));
+        goto done;
+    }
+
+    left = st.st_size;
+    while (left > 0) {
+        n = sendfile(fd_to, fd_from, NULL, left);
+
+        if (n == -1) {
+            *error_len = snprintf(error, RESULT_MAX_LEN, "Error copying partition: %s", strerror(errno));
+            goto done;
+        }
+
+        left -= n;
+    }
+
+    success = true;
+
+done:
+    if (fd_from != -1) {
+        close(fd_from);
+    }
+    if (fd_to != -1) {
+        close(fd_to);
+        if (!success) {
+            remove(file_to);
+        }
+    }
+
+    return success;
+}
+
 /**
  * Calling convention is MOVE_PARTITION('user', 'password', 'database', 'table', 'partition', 'new data directory')
  */
@@ -282,8 +337,16 @@ move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *le
     }
 
     if (rename(file_from, file_to) != 0) {
-        *length = snprintf(result, RESULT_MAX_LEN, "Error moving partition: %s", strerror(errno));
-        goto unlock;
+        if (errno == EXDEV) {
+            //tried to move a file across mount points, use sendfile instead()
+            if (!copy_partition(file_from, file_to, result, length)) {
+                goto unlock;
+            }
+        }
+        else {
+            *length = snprintf(result, RESULT_MAX_LEN, "Error moving partition: %s", strerror(errno));
+            goto unlock;
+        }
     }
 
     if (symlink(file_to, file_from) != 0) {
