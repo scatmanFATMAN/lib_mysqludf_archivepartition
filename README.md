@@ -25,4 +25,5 @@
 <ul>
   <li>Figure out a better way to pass the MySQL credentials. Maybe pass a file path to a config file as the first argument which includes username and password instead.</li>
   <li>Write a function to drop the partition. Using MySQL's DROP PARTITION will drop the partition, but keep the symbolic link.</li>
+  <li>Support Windows, maybe.</li>
 </ul>
