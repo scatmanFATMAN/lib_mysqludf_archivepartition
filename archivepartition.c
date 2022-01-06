@@ -39,7 +39,9 @@ args_to_params(UDF_ARGS *args, params_t *params) {
     params->database = args->args[2];
     params->table = args->args[3];
     params->partition = args->args[4];
-    params->data_directory = args->args[5];
+    if (args->arg_count == 6) {
+        params->data_directory = args->args[5];
+    }
 }
 
 static config_t config = {
@@ -155,22 +157,29 @@ validate_partition(MYSQL *mysql, params_t *params, char *error, unsigned long *e
 }
 
 static bool
-get_file_from(MYSQL *mysql, params_t *params, char *file_from, size_t file_from_size, char *error, unsigned long *error_len) {
+get_partition_path(MYSQL *mysql, params_t *params, bool default_data_dir, char *path, size_t path_size, char *error, unsigned long *error_len) {
     bool success;
     char dir[2048];
     size_t dir_len;
 
-    success = get_variable(mysql, "datadir", dir, sizeof(dir), &dir_len, error, error_len);
-    if (!success) {
-        return false;
+    if (default_data_dir) {
+        success = get_variable(mysql, "datadir", dir, sizeof(dir), &dir_len, error, error_len);
+        if (!success) {
+            return false;
+        }
+    }
+    else {
+        dir_len = strlcpy(dir, params->data_directory, sizeof(dir));
     }
 
     //remove a trailing slash if it has one
-    if (dir[dir_len - 1] == '/') {
-        dir[dir_len - 1] = '\0';
+    if (dir_len > 0) {
+        if (dir[dir_len - 1] == '/') {
+            dir[dir_len - 1] = '\0';
+        }
     }
 
-    snprintf(file_from, file_from_size, "%s/%s/%s#P#%s.ibd", dir, params->database, params->table, params->partition);
+    snprintf(path, path_size, "%s/%s/%s#P#%s.ibd", dir, params->database, params->table, params->partition);
 
     return true;
 }
@@ -253,7 +262,7 @@ move_partition_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
     args_to_params(args, &params);
 
     //validate the new data directory
-    if (stat(params.data_directory, &st) != 0) {
+    if (stat(params.data_directory, &st) == -1) {
         snprintf(message, MYSQL_ERRMSG_SIZE, "'%s': %s", params.data_directory, strerror(errno));
         return 1;
     }
@@ -311,13 +320,16 @@ move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *le
         goto done;
     }
 
-    //get partition's new file name
-    if (!get_file_from(mysql, &params, file_from, sizeof(file_from), result, length)) {
+    //get partition's path
+    if (!get_partition_path(mysql, &params, true, file_from, sizeof(file_from), result, length)) {
         goto done;
     }
 
+    //get the partition's new dir and path
     snprintf(dir_to, sizeof(dir_to), "%s/%s", params.data_directory, params.database);
-    snprintf(file_to, sizeof(file_to), "%s/%s#P#%s.ibd", dir_to, params.table, params.partition);
+    if (!get_partition_path(mysql, &params, false, file_to, sizeof(file_to), result, length)) {
+        goto done;
+    }
 
     //create <data directory>/<database> if it doesn't exist
     if (access(dir_to, F_OK) != 0) {
@@ -348,6 +360,115 @@ move_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *le
 
     if (symlink(file_to, file_from) != 0) {
         *length = snprintf(result, RESULT_MAX_LEN, "Error creating symbolic link: %s", strerror(errno));
+        goto unlock;
+    }
+
+    *length = strlcpy(result, "OK", RESULT_MAX_LEN);
+
+unlock:
+    len = snprintf(query, sizeof(query), "UNLOCK TABLES");
+    mysql_real_query(mysql, query, len);
+
+done:
+    if (mysql != NULL) {
+        mysql_close(mysql);
+    }
+
+    return result;
+}
+
+/**
+ * Calling convention is DROP_PARTITION('user', 'password', 'database', 'table', 'partition')
+ */
+
+my_bool
+drop_partition_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
+    params_t params;
+    int i;
+
+    if (args->arg_count != 5) {
+        strlcpy(message, "Expected 5 parameters", MYSQL_ERRMSG_SIZE);
+        return 1;
+    }
+
+    for (i = 0; i < 5; i++) {
+        if (args->arg_type[i] != STRING_RESULT) {
+            snprintf(message, MYSQL_ERRMSG_SIZE, "Parameter %d must be a string", i + 1);
+            return 1;
+        }
+    }
+
+    args_to_params(args, &params);
+
+    initid->max_length = RESULT_MAX_LEN;
+
+    //the result cannot be NULL
+    initid->maybe_null = 0;
+
+    //the result is not constant
+    initid->const_item = 0;
+
+    return 0;
+}
+
+void
+drop_partition_deinit(UDF_INIT *initid) {
+}
+
+char *
+drop_partition(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *length, char *is_null, char *error) {
+    char query[256], file_link[2048 + 256], file[2048 * 2];
+    MYSQL* mysql;
+    params_t params;
+    int len;
+
+    *is_null = 0;
+    *error = 0;
+
+    args_to_params(args, &params);
+
+    mysql = mysql_init(NULL);
+    if (mysql == NULL) {
+        *length = strlcpy(result, "Out of memory", RESULT_MAX_LEN);
+        goto done;
+    }
+
+    if (mysql_real_connect(mysql, NULL, params.user, params.password, params.database, config.port, config.socket, 0) == NULL) {
+        *length = snprintf(result, RESULT_MAX_LEN, "Error connecting to MySQL: %s", mysql_error(mysql));
+        goto done;
+    }
+
+    //make sure the partition exists
+    if (!validate_partition(mysql, &params, result, length)) {
+        goto done;
+    }
+
+    //get partition's file symlink
+    if (!get_partition_path(mysql, &params, true, file_link, sizeof(file_link), result, length)) {
+        goto done;
+    }
+
+    //read the symlink
+    if (readlink(file_link, file, sizeof(file)) == -1) {
+        *length = snprintf(result, RESULT_MAX_LEN, "Error reading %s: %s", file_link, strerror(errno));
+    }
+
+    len = snprintf(query, sizeof(query), "LOCK TABLE `%s` WRITE", params.table);
+    if (mysql_real_query(mysql, query, len) != 0) {
+        *length = snprintf(result, RESULT_MAX_LEN, "Error getting write lock: %s", mysql_error(mysql));
+        goto done;
+    }
+
+    //issue the ALTER TABLE/DROP PARTITION to remove the symlink and tell MySQL to remove the partition
+    len = snprintf(query, sizeof(query), "ALTER TABLE `%s` DROP PARTITION `%s`", params.table, params.partition);
+    if (mysql_real_query(mysql, query, len) != 0) {
+        *length = snprintf(result, RESULT_MAX_LEN, "Error dropping partition: %s", mysql_error(mysql));
+        goto done;
+    }
+
+    //remove the partition's data file
+    if (unlink(file) != 0) {
+        *length = snprintf(result, RESULT_MAX_LEN, "Error dropping partition: %s", strerror(errno));
         goto unlock;
     }
 
